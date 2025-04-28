@@ -1,7 +1,8 @@
 import {VoiceChannel, Snowflake} from 'discord.js';
 import {Readable} from 'stream';
 import hasha from 'hasha';
-import ytdl, {videoFormat} from '@distube/ytdl-core';
+import {exec as execCallback} from 'child_process';
+import {promisify} from 'util';
 import {WriteStream} from 'fs-capacitor';
 import ffmpeg from 'fluent-ffmpeg';
 import shuffle from 'array-shuffle';
@@ -21,6 +22,39 @@ import debug from '../utils/debug.js';
 import {getGuildSettings} from '../utils/get-guild-settings.js';
 import {buildPlayingMessageEmbed} from '../utils/build-embed.js';
 import {Setting} from '@prisma/client';
+
+// Promisify exec for async/await usage
+const exec = promisify(execCallback);
+
+// Define types for yt-dlp output
+interface YtDlpFormat {
+  format_id: string;
+  url: string;
+  acodec: string;
+  vcodec: string | null;
+  tbr?: number;
+  abr?: number;
+  asr?: number;
+  ext: string;
+  container?: string;
+  format_note?: string;
+  audio_channels?: number;
+  quality?: number;
+  has_audio?: boolean;
+  loudness?: number;
+}
+
+interface YtDlpVideoInfo {
+  id: string;
+  title: string;
+  formats: YtDlpFormat[];
+  duration: number;
+  is_live: boolean;
+  thumbnail: string;
+  description: string;
+  uploader: string;
+  webpage_url: string;
+}
 
 export enum MediaSource {
   Youtube,
@@ -58,7 +92,7 @@ export interface PlayerEvents {
   statusChange: (oldStatus: STATUS, newStatus: STATUS) => void;
 }
 
-type YTDLVideoFormat = videoFormat & {loudnessDb?: number};
+type YtDlpAudioFormat = YtDlpFormat & {loudnessDb?: number};
 
 export const DEFAULT_VOLUME = 100;
 
@@ -255,7 +289,8 @@ export default class {
     } catch (error: unknown) {
       await this.forward(1);
 
-      if ((error as {statusCode: number}).statusCode === 410 && currentSong) {
+      // Safely check if error is an object and has statusCode property
+      if (typeof error === 'object' && error !== null && 'statusCode' in error && (error as {statusCode: number}).statusCode === 410 && currentSong) {
         const channelId = currentSong.addedInChannelId;
 
         if (channelId) {
@@ -509,70 +544,75 @@ export default class {
     const ffmpegInputOptions: string[] = [];
     let shouldCacheVideo = false;
 
-    let format: YTDLVideoFormat | undefined;
+    let format: YtDlpAudioFormat | undefined;
 
     ffmpegInput = await this.fileCache.getPathFor(this.getHashForCache(song.url));
 
     if (!ffmpegInput) {
       // Not yet cached, must download
-      const info = await ytdl.getInfo(song.url);
+      try {
+        // Use yt-dlp to get video info and formats
+        const {stdout} = await exec(`yt-dlp -j "${song.url}"`);
+        const info = JSON.parse(stdout) as YtDlpVideoInfo;
 
-      const formats = info.formats as YTDLVideoFormat[];
+        // Find audio formats
+        const formats = info.formats as YtDlpAudioFormat[];
 
-      const filter = (format: ytdl.videoFormat): boolean => format.codecs === 'opus' && format.container === 'webm' && format.audioSampleRate !== undefined && parseInt(format.audioSampleRate, 10) === 48000;
+        // Filter for opus webm formats with 48kHz sample rate, similar to previous logic
+        const opusWebmFormats = formats.filter(format =>
+          format.acodec === 'opus'
+          && format.ext === 'webm'
+          && format.asr === 48000
+          && (format.vcodec === 'none' || format.vcodec === null),
+        );
 
-      format = formats.find(filter);
+        if (opusWebmFormats.length > 0) {
+          // Sort by audio quality
+          format = opusWebmFormats.sort((a, b) => (b.abr ?? 0) - (a.abr ?? 0))[0];
+        } else {
+          // Fallback to best audio
+          const audioFormats = formats.filter(format =>
+            format.has_audio
+            && (format.vcodec === 'none' || format.vcodec === null),
+          );
 
-      const nextBestFormat = (formats: ytdl.videoFormat[]): ytdl.videoFormat | undefined => {
-        if (formats.length < 1) {
-          return undefined;
+          if (audioFormats.length > 0) {
+            // Sort by audio quality
+            format = audioFormats.sort((a, b) => (b.abr ?? 0) - (a.abr ?? 0))[0];
+          } else {
+            // If no audio-only formats, take the best format with audio
+            format = formats
+              .filter(format => format.has_audio)
+              .sort((a, b) => (b.abr ?? 0) - (a.abr ?? 0))[0];
+          }
         }
-
-        if (formats[0].isLive) {
-          formats = formats.sort((a, b) => (b as unknown as {audioBitrate: number}).audioBitrate - (a as unknown as {audioBitrate: number}).audioBitrate); // Bad typings
-
-          return formats.find(format => [128, 127, 120, 96, 95, 94, 93].includes(parseInt(format.itag as unknown as string, 10))); // Bad typings
-        }
-
-        formats = formats
-          .filter(format => format.averageBitrate)
-          .sort((a, b) => {
-            if (a && b) {
-              return b.averageBitrate! - a.averageBitrate!;
-            }
-
-            return 0;
-          });
-        return formats.find(format => !format.bitrate) ?? formats[0];
-      };
-
-      if (!format) {
-        format = nextBestFormat(info.formats);
 
         if (!format) {
-          // If still no format is found, throw
           throw new Error('Can\'t find suitable format.');
         }
+
+        debug('Using format', format);
+
+        ffmpegInput = format.url;
+
+        // Don't cache livestreams or long videos
+        const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
+        shouldCacheVideo = !info.is_live && info.duration < MAX_CACHE_LENGTH_SECONDS && !options.seek;
+
+        debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
+
+        ffmpegInputOptions.push(...[
+          '-reconnect',
+          '1',
+          '-reconnect_streamed',
+          '1',
+          '-reconnect_delay_max',
+          '5',
+        ]);
+      } catch (error) {
+        console.error('Error getting video info with yt-dlp:', error);
+        throw new Error(`Failed to get video info: ${String(error)}`);
       }
-
-      debug('Using format', format);
-
-      ffmpegInput = format.url;
-
-      // Don't cache livestreams or long videos
-      const MAX_CACHE_LENGTH_SECONDS = 30 * 60; // 30 minutes
-      shouldCacheVideo = !info.player_response.videoDetails.isLiveContent && parseInt(info.videoDetails.lengthSeconds, 10) < MAX_CACHE_LENGTH_SECONDS && !options.seek;
-
-      debug(shouldCacheVideo ? 'Caching video' : 'Not caching video');
-
-      ffmpegInputOptions.push(...[
-        '-reconnect',
-        '1',
-        '-reconnect_streamed',
-        '1',
-        '-reconnect_delay_max',
-        '5',
-      ]);
     }
 
     if (options.seek) {
@@ -588,7 +628,7 @@ export default class {
       cacheKey: song.url,
       ffmpegInputOptions,
       cache: shouldCacheVideo,
-      volumeAdjustment: format?.loudnessDb ? `${-format.loudnessDb}dB` : undefined,
+      volumeAdjustment: format?.loudness ? `${-format.loudness}dB` : undefined,
     });
   }
 
@@ -617,17 +657,13 @@ export default class {
       return;
     }
 
-    if (this.voiceConnection.listeners(VoiceConnectionStatus.Disconnected).length === 0) {
-      this.voiceConnection.on(VoiceConnectionStatus.Disconnected, this.onVoiceConnectionDisconnect.bind(this));
-    }
+    this.voiceConnection.on(VoiceConnectionStatus.Disconnected, this.onVoiceConnectionDisconnect.bind(this));
 
     if (!this.audioPlayer) {
       return;
     }
 
-    if (this.audioPlayer.listeners('stateChange').length === 0) {
-      this.audioPlayer.on(AudioPlayerStatus.Idle, this.onAudioPlayerIdle.bind(this));
-    }
+    this.audioPlayer.on(AudioPlayerStatus.Idle, this.onAudioPlayerIdle.bind(this));
   }
 
   private onVoiceConnectionDisconnect(): void {
@@ -671,7 +707,8 @@ export default class {
 
       if (options?.cache) {
         const cacheStream = this.fileCache.createWriteStream(this.getHashForCache(options.cacheKey));
-        capacitor.createReadStream().pipe(cacheStream);
+        const readStream = capacitor.createReadStream();
+        (readStream as unknown as {pipe: (destination: unknown) => void}).pipe(cacheStream as unknown);
       }
 
       const returnedStream = capacitor.createReadStream();
@@ -682,15 +719,18 @@ export default class {
         .noVideo()
         .audioCodec('libopus')
         .outputFormat('webm')
-        .addOutputOption(['-filter:a', `volume=${options?.volumeAdjustment ?? '1'}`])
-        .on('error', error => {
-          if (!hasReturnedStreamClosed) {
-            reject(error);
-          }
-        })
-        .on('start', command => {
-          debug(`Spawned ffmpeg with ${command}`);
-        });
+        .addOutputOption(['-filter:a', `volume=${options?.volumeAdjustment ?? '1'}`]);
+
+      // Use type assertion for the 'on' method
+      (stream as any).on('error', (err: Error) => {
+        if (!hasReturnedStreamClosed) {
+          reject(err);
+        }
+      });
+
+      (stream as any).on('start', (commandLine: string) => {
+        debug(`Spawned ffmpeg with ${commandLine}`);
+      });
 
       stream.pipe(capacitor);
 
