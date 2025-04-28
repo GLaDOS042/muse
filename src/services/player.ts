@@ -1,11 +1,10 @@
 import {VoiceChannel, Snowflake} from 'discord.js';
 import {Readable} from 'stream';
 import hasha from 'hasha';
-import {exec as execCallback} from 'child_process';
-import {promisify} from 'util';
 import {WriteStream} from 'fs-capacitor';
 import ffmpeg from 'fluent-ffmpeg';
 import shuffle from 'array-shuffle';
+import youtubedl from 'youtube-dl-exec';
 import {
   AudioPlayer,
   AudioPlayerState,
@@ -23,10 +22,6 @@ import {getGuildSettings} from '../utils/get-guild-settings.js';
 import {buildPlayingMessageEmbed} from '../utils/build-embed.js';
 import {Setting} from '@prisma/client';
 
-// Promisify exec for async/await usage
-const exec = promisify(execCallback);
-
-// Define types for yt-dlp output
 interface YtDlpFormat {
   format_id: string;
   url: string;
@@ -59,6 +54,7 @@ interface YtDlpVideoInfo {
 export enum MediaSource {
   Youtube,
   HLS,
+  Bilibili,
 }
 
 export interface QueuedPlaylist {
@@ -551,43 +547,50 @@ export default class {
     if (!ffmpegInput) {
       // Not yet cached, must download
       try {
-        // Use yt-dlp to get video info and formats
-        const {stdout} = await exec(`yt-dlp -j "${song.url}"`);
-        const info = JSON.parse(stdout) as YtDlpVideoInfo;
+        // Use youtube-dl-exec to get video info and formats
+        // Ensure song.url is not null before passing
+        if (!song.url) {
+          throw new Error('Song URL is missing');
+        }
+        const info = await youtubedl(song.url, {
+          dumpSingleJson: true,
+          // Consider adding format selection flags if needed, e.g.:
+          // format: 'bestaudio[ext=webm]/bestaudio/best'
+        }) as YtDlpVideoInfo;
 
         // Find audio formats
         const formats = info.formats as YtDlpAudioFormat[];
 
-        // Filter for opus webm formats with 48kHz sample rate, similar to previous logic
-        const opusWebmFormats = formats.filter(format =>
-          format.acodec === 'opus'
-          && format.ext === 'webm'
-          && format.asr === 48000
-          && (format.vcodec === 'none' || format.vcodec === null),
+        // --- REVISED FORMAT SELECTION LOGIC ---
+        // 1. Prefer opus/webm audio-only formats (often higher quality/efficiency)
+        format = formats.find(f =>
+          f.acodec === 'opus'
+          && (f.ext === 'webm' || f.ext === 'opus') // Check extension too
+          // && f.asr === 48000 // Temporarily removing sample rate check for broader compatibility
+          && (f.vcodec === 'none' || f.vcodec === null)
         );
 
-        if (opusWebmFormats.length > 0) {
-          // Sort by audio quality
-          format = opusWebmFormats.sort((a, b) => (b.abr ?? 0) - (a.abr ?? 0))[0];
-        } else {
-          // Fallback to best audio
-          const audioFormats = formats.filter(format =>
-            format.has_audio
-            && (format.vcodec === 'none' || format.vcodec === null),
+        // 2. Fallback to other common audio-only formats (like m4a from Bilibili)
+        if (!format) {
+          format = formats.find(f =>
+            (f.acodec !== 'none' && f.acodec !== null) // Has an audio codec
+            && (f.vcodec === 'none' || f.vcodec === null) // No video codec
           );
-
-          if (audioFormats.length > 0) {
-            // Sort by audio quality
-            format = audioFormats.sort((a, b) => (b.abr ?? 0) - (a.abr ?? 0))[0];
-          } else {
-            // If no audio-only formats, take the best format with audio
-            format = formats
-              .filter(format => format.has_audio)
-              .sort((a, b) => (b.abr ?? 0) - (a.abr ?? 0))[0];
-          }
         }
 
+        // 3. Fallback to the best *available* audio stream according to yt-dlp, even if muxed with video
+        //    Sort by average bitrate (abr) or total bitrate (tbr) descending.
         if (!format) {
+           const sortedFormats = formats
+             .filter(f => f.acodec !== 'none' && f.acodec !== null) // Ensure it actually has audio
+             .sort((a, b) => (b.abr ?? b.tbr ?? 0) - (a.abr ?? a.tbr ?? 0)); // Sort by bitrate
+           format = sortedFormats.at(0); // Take the best one
+        }
+        // --- END REVISED LOGIC ---
+
+        if (!format) {
+          // Add logging for debugging purposes if no format is found
+          console.error("Available formats for URL:", song.url, JSON.stringify(formats, null, 2));
           throw new Error('Can\'t find suitable format.');
         }
 
@@ -610,7 +613,7 @@ export default class {
           '5',
         ]);
       } catch (error) {
-        console.error('Error getting video info with yt-dlp:', error);
+        console.error('Error getting video info with youtube-dl-exec:', error);
         throw new Error(`Failed to get video info: ${String(error)}`);
       }
     }

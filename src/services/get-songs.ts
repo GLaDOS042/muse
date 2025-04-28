@@ -5,16 +5,23 @@ import {TYPES} from '../types.js';
 import ffmpeg from 'fluent-ffmpeg';
 import YoutubeAPI from './youtube-api.js';
 import SpotifyAPI, {SpotifyTrack} from './spotify-api.js';
+import BilibiliAPI from './bilibili-api.js';
 import {URL} from 'node:url';
 
 @injectable()
 export default class {
   private readonly youtubeAPI: YoutubeAPI;
   private readonly spotifyAPI?: SpotifyAPI;
+  private readonly bilibiliAPI: BilibiliAPI;
 
-  constructor(@inject(TYPES.Services.YoutubeAPI) youtubeAPI: YoutubeAPI, @inject(TYPES.Services.SpotifyAPI) @optional() spotifyAPI?: SpotifyAPI) {
+  constructor(
+    @inject(TYPES.Services.YoutubeAPI) youtubeAPI: YoutubeAPI,
+    @inject(TYPES.Services.BilibiliAPI) bilibiliAPI: BilibiliAPI,
+    @inject(TYPES.Services.SpotifyAPI) @optional() spotifyAPI?: SpotifyAPI,
+  ) {
     this.youtubeAPI = youtubeAPI;
     this.spotifyAPI = spotifyAPI;
+    this.bilibiliAPI = bilibiliAPI;
   }
 
   async getSongs(query: string, playlistLimit: number, shouldSplitChapters: boolean): Promise<[SongMetadata[], string]> {
@@ -71,6 +78,14 @@ export default class {
         }
 
         newSongs.push(...convertedSongs);
+      } else if (url.host === 'www.bilibili.com') {
+        // Bilibili video
+        const song = await this.bilibiliVideo(url.href);
+        if (song) {
+          newSongs.push(song);
+        } else {
+          throw new Error('that doesn\'t exist');
+        }
       } else {
         const song = await this.httpLiveStream(query);
 
@@ -189,5 +204,28 @@ export default class {
     }, []);
 
     return [songs, nSongsNotFound, tracks.length];
+  }
+
+  private async bilibiliVideo(url: string): Promise<SongMetadata | null> {
+    try {
+      const videoInfo = await this.bilibiliAPI.getVideoInfo(url);
+
+      // Map Bilibili info to SongMetadata
+      const song: SongMetadata = {
+        title: videoInfo.title,
+        artist: videoInfo.uploader,
+        url: videoInfo.webpage_url, // Use the webpage URL; Player handles fetching stream
+        length: videoInfo.duration,
+        offset: 0,
+        playlist: null,
+        isLive: videoInfo.is_live ?? false,
+        thumbnailUrl: videoInfo.thumbnail,
+        source: MediaSource.Bilibili,
+      };
+      return song;
+    } catch (error) {
+      console.error(`Error processing Bilibili URL ${url}:`, error);
+      return null; // Return null if fetching or processing fails
+    }
   }
 }

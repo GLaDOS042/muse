@@ -27,8 +27,8 @@ export default class implements Command {
     this.addQueryToQueue = addQueryToQueue;
 
     const queryDescription = thirdParty === undefined
-      ? 'YouTube URL or search query'
-      : 'YouTube URL, Spotify URL, or search query';
+      ? 'YouTube URL, Bilibili URL or search query'
+      : 'YouTube URL, Bilibili URL, Spotify URL, or search query';
 
     this.slashCommand = new SlashCommandBuilder()
       .setName('play')
